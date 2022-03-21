@@ -1,0 +1,478 @@
+#!/usr/bin/python
+import numpy             as np
+import matplotlib.pyplot as plt
+import scipy.integrate   as integrate
+
+from scipy.linalg  import cho_solve, cho_factor, expm, inv
+from scipy.spatial import distance_matrix as dist
+from scipy.stats   import multivariate_normal
+
+def cart_to_polar(x, y):
+    if y == 0:
+        if x == 0:
+            return np.array([0, 0])
+        return np.array([np.sqrt(x ** 2 + y ** 2), np.sign(x)*np.pi/2])
+    return np.array([np.sqrt(x ** 2 + y ** 2), np.arctan(x / y)])
+
+
+def polar_to_cart(r, theta):
+    return np.array([r * np.sin(theta), r * np.cos(theta)])
+
+
+def cart_to_skew_polar(x, y, offset):
+    if y == 0:
+        return np.array([np.sqrt((x - offset) ** 2 + y ** 2), np.sign(x)*np.pi/2])
+    return np.array([np.sqrt((x - offset) ** 2 + y ** 2), np.arctan((x - offset) / y)])
+
+
+def skew_polar_to_cart(r, theta, offset):
+    return np.array([r * np.sin(theta) + offset, r * np.cos(theta)])
+
+
+def polar_to_skew_polar(r, theta, offset):
+    tmp = polar_to_cart(r, theta)
+    return cart_to_skew_polar(tmp[0], tmp[1], offset)
+
+
+def skew_polar_to_polar(r, theta, offset):
+    tmp = skew_polar_to_cart(r, theta, offset)
+    return cart_to_polar(tmp[0], tmp[1])
+
+
+def find_intersect(angle, offset, rec_mean, rec_angle):
+    dots    = np.array([polar_to_cart(rec_mean[i], rec_angle[i]) for i in range(rec_mean.size)]).T
+    rot_mat = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+
+    dots[0, :] = dots[0, :] - offset
+    dots       = np.dot(rot_mat, dots)
+
+    bounds    = dots[:, np.abs(dots[0, :]).argsort()[0:2]]
+    bounds    = np.dot(rot_mat.T, bounds)
+
+    b1 = np.tan(np.pi / 2 - angle)
+    b2 = (bounds[1, 1] - bounds[1, 0]) / (bounds[0, 1] - bounds[0, 0])
+    a2 = bounds[1, 1] - b2 * bounds[0, 1]
+
+    inter_x = (-a2) / (b2 - b1)
+
+    return np.array([inter_x + offset, b2 * inter_x + a2])
+
+def get_corr(x, beta):
+    x  = x / beta
+    x  = x.reshape([x.size, 1])
+    dd = dist(x, x, p=2)
+    return (1 + np.sqrt(3)*dd) * np.exp(-np.sqrt(3) * dd) # Matern 3/2
+
+
+def set_nan(velocity):
+    for jj in range(velocity.shape[1]):
+        if np.all(np.isnan(velocity[:, jj])):
+            continue
+        nan_inds = np.where(velocity[:, jj] < -100.)
+        end_time = np.min(nan_inds)
+        while velocity[end_time - 1, jj] > velocity[end_time, jj]:
+            nan_inds = np.append(nan_inds, np.min(nan_inds) - 1)
+            end_time = end_time - 1
+        velocity[nan_inds, jj] = np.nan
+
+
+class Reconstruction:
+
+    def __init__(self, n_times, init_r, probe_angles, probe_offset, pred_angles, probe_vel, probe_pos, times, dt):
+        self.times             = times
+        self.probe_vel_orig    = probe_vel
+        self.probe_pos_orig    = probe_pos
+        self.probe_vel      = probe_vel.copy()
+        self.probe_pos      = probe_pos.copy()
+        self.probe_vel[:,:] = np.nan
+        self.probe_pos[:,:] = np.nan
+        self.pred_angles  = pred_angles
+        self.probe_angles = probe_angles
+        self.n_times   = self.probe_vel.shape[0]
+        self.n_pred    = pred_angles.size
+        self.n_probe   = probe_angles.size
+        self.jump_obs  = np.arange(probe_angles.size)
+        self.get_jumps()
+        for ii in range(probe_vel.shape[1]):
+            j_time = self.jump_times(probe_angles[ii])
+            t_inds = np.where(times >= j_time)
+            self.probe_vel[range(np.array(t_inds).size), ii] = probe_vel[t_inds, ii]
+            self.probe_pos[range(np.array(t_inds).size), ii] = probe_pos[t_inds, ii]
+        self.angles       = np.concatenate((probe_angles, pred_angles))
+        self.probe_offset = probe_offset
+        self.obs_angles   = np.zeros([probe_angles.size, n_times])
+        for ii in range(probe_angles.size):
+            cart_front             = find_intersect(probe_angles[ii],
+                                                    probe_offset[ii],
+                                                    init_r + np.zeros(pred_angles.size),
+                                                    pred_angles)
+            pole_front             = cart_to_polar(cart_front[0], cart_front[1])
+            self.obs_angles[ii, 0] = pole_front[1]
+        
+        self.n_angle   = self.n_pred + self.n_probe
+        self.init_r    = init_r
+        self.lam       = np.sqrt(3)/ 0.1 # Controls temporal correlation length - denominator in units of time
+        self.lam2      = np.sqrt(3)/10.  # Controls temporal correlation length - denominator in units of time
+        self.lam_decay = 500.            # Controls decay between above correlation lengths - how many time steps is 1/e decay
+        self.beta      = 0.25       # Angular distance in radians that correlation between velocity increments are 1/e
+        self.sigsq_vel = 20.**2     # Variance of the measurement uncertainty on velocity in velocity units squared
+        self.sigsq_pos = 0.005**2   # Variance of the measurement uncertainty on position in position units squared
+        self.kappa     = 2.0e5**2   # Variance of the spatial covariance of velocity increments in acceleration units squared
+        self.dt        = dt
+        self.con_scale = 10.0
+        self.lin_scale = 1.0
+        self.kf_mean   = np.zeros([3 * self.n_angle+3, n_times])
+        self.kf_var    = np.zeros([3 * self.n_angle+3, n_times])
+        self.kf_cov    = np.zeros([3 * self.n_angle+3, 3 * self.n_angle+3, n_times])
+        self.vel_mean  = None
+        self.vel_cov   = None
+        self.vel_var   = None
+        self.pos_mean  = None
+        self.pos_cov   = None
+        self.pos_var   = None
+        self.l_like    = 0.
+            
+    def outlier_psi(self, resid, sd):
+        # Winsorizing weight
+        W = [np.max( ( np.min((resid[ii]/sd[ii], 3)), -3) )*sd[ii] for ii in range(len(resid))]
+        return np.array(W)
+    
+    def get_jumps(self):
+        for ii in range(self.n_probe):
+            first_big_vel = np.where( self.probe_vel_orig[:, ii] > 0.100)[0][0]
+            first_peak    = np.where( np.diff( self.probe_vel_orig[first_big_vel:, ii] ) < 0)[0][0] + 1
+            self.jump_obs[ii] = first_big_vel + first_peak
+
+    def jump_times(self, angle):
+        if angle < np.min(self.probe_angles):
+            temp_ang = angle - np.min(self.probe_angles)
+            mm       = (self.times[self.jump_obs[np.argmin(self.probe_angles)]] - self.times[self.jump_obs[np.argsort(self.probe_angles)[1]]])/(np.min(self.probe_angles) - np.sort(self.probe_angles)[1])
+            return( mm*temp_ang + self.times[self.jump_obs[np.argmin(self.probe_angles)]] )
+        if angle > np.max(self.probe_angles):
+            temp_ang = angle - np.max(self.probe_angles)
+            mm       = (self.times[self.jump_obs[np.argmax(self.probe_angles)]] - self.times[self.jump_obs[np.argsort(self.probe_angles)[::-1][1]]])/(np.max(self.probe_angles) - np.sort(self.probe_angles)[::-1][1])
+            return( mm*temp_ang + self.times[self.jump_obs[np.argmax(self.probe_angles)]] )
+        ang_sort  = np.argsort(self.probe_angles)
+        which_seg = np.where(angle <= self.probe_angles[ang_sort])[0][0]
+        mix_val   = (angle - self.probe_angles[ang_sort][which_seg-1])/(self.probe_angles[ang_sort][which_seg] - self.probe_angles[ang_sort][which_seg-1])
+        return self.times[self.jump_obs[ang_sort][which_seg]] * mix_val + self.times[self.jump_obs[ang_sort][which_seg-1]] * (1 - mix_val)
+
+    def jump_vel(self, angle):
+        if angle < np.min(self.probe_angles):
+            return( self.probe_vel[0, np.argmin(self.probe_angles)])
+        if angle > np.max(self.probe_angles):
+            return( self.probe_vel[0, np.argmax(self.probe_angles)])
+        ang_sort  = np.argsort(self.probe_angles)
+        which_seg = np.where(angle <= self.probe_angles[ang_sort])[0][0]
+        mix_val   = (angle - self.probe_angles[ang_sort][which_seg-1])/(self.probe_angles[ang_sort][which_seg] - self.probe_angles[ang_sort][which_seg-1])
+        vel1 = self.probe_vel[0, ang_sort[which_seg]  ]
+        vel2 = self.probe_vel[0, ang_sort[which_seg-1]]
+        return vel1 * mix_val +  vel2 * (1 - mix_val)
+
+    def plot_surface(self, t, figsize=(5, 5), theta_range=(-90, 90)):
+        inds   = np.arange(self.n_pred) + self.n_probe
+        surface_mean = self.pos_mean[inds, t]
+
+        fig  = plt.figure(figsize=figsize)
+        ax   = fig.add_subplot(111, polar=True)
+        ax.plot(self.pred_angles, surface_mean)
+
+        ax.set_rorigin(0)
+        ax.set_theta_offset(np.pi/2)
+        ax.set_thetagrids(np.arange(-90, 90, 30))
+        ax.set_thetamin(theta_range[0])
+        ax.set_thetamax(theta_range[1])
+        ax.set_ylim(0, 0.085*1.0e3)
+        ax.set_yticks(np.arange(0, 0.085*1.0e3, 0.02*1.0e3))
+
+        ax.fill_between(self.pred_angles,
+                        self.pos_mean[inds, t] - 2 * np.sqrt(self.pos_var[inds,t]),
+                        self.pos_mean[inds, t] + 2 * np.sqrt(self.pos_var[inds,t]),
+                        alpha       = 0.25,
+                        facecolor   = 'b',
+                        interpolate = True)
+
+        for ii in range(self.n_probe):
+            p1 = skew_polar_to_polar(0, self.probe_angles[ii], self.probe_offset[ii])
+            ax.plot([p1[1], self.obs_angles[ii, t]], [p1[0], self.pos_mean[ii, t]],
+                    color='#ff8080', alpha=0.75)
+        plt.show()
+
+    def plot_for_animation(self, folder, ts = 50, figsize=(10, 10), theta_range=(-90, 90)):
+        point_inds   = np.arange(self.n_pred) + self.n_probe
+
+        for t in range(1, self.n_times, ts):
+            surface_mean = self.pos_mean[point_inds, t]
+
+            fig  = plt.figure(figsize=figsize, dpi=100)
+            ax   = fig.add_subplot(111, polar=True)
+            ax.plot(self.pred_angles, surface_mean)
+
+            ax.set_theta_offset(np.pi/2)
+            ax.set_thetagrids(np.arange(-90, 90, 30))
+            ax.set_thetamin(theta_range[0])
+            ax.set_thetamax(theta_range[1])
+            ax.set_ylim(0, 0.085*1.0e3)
+            ax.set_yticks(np.arange(0, 0.085*1.0e3, 0.02*1.0e3))
+
+            inds = np.arange(self.n_pred) + self.n_probe
+            ax.fill_between(self.pred_angles,
+                            self.pos_mean[inds, t] - 2 * np.sqrt(self.pos_var[inds, t]),
+                            self.pos_mean[inds, t] + 2 * np.sqrt(self.pos_var[inds, t]),
+                            alpha       = 0.25,
+                            facecolor   = 'b',
+                            interpolate = True)
+
+            for ii in range(self.n_probe):
+                p1 = skew_polar_to_polar(0, self.probe_angles[ii], self.probe_offset[ii])
+                ax.plot([p1[1], self.obs_angles[ii, t]], [p1[0], self.kf_mean[ii, t]],
+                        color='#ff8080', alpha=0.75)
+            plt.savefig(folder+'{0:04d}'.format(t)+".png", bbox_inches='tight')
+            plt.close(fig)
+
+    def plot_velocity(self, t, figsize=(5, 5)):
+        n_skip = self.n_probe
+        inds   = np.arange(self.n_pred) + n_skip
+        surface_mean = self.vel_mean[inds, t]
+
+        fig  = plt.figure(figsize=figsize)
+        ax   = fig.add_subplot(111)
+        ax.plot(self.pred_angles, surface_mean)
+
+        ax.fill_between(self.pred_angles,
+                        self.vel_mean[inds, t] + 2 * np.sqrt(self.vel_var[inds,t]),
+                        self.vel_mean[inds, t] - 2 * np.sqrt(self.vel_var[inds,t]),
+                        alpha=0.25, facecolor='b', interpolate=True)
+        plt.show()
+    
+    def get_t_q_matrices(self,t):
+        t_matrix = np.zeros([3 * self.n_angle+3, 3 * self.n_angle+3])
+        new_lam  = ( (self.lam - self.lam2)*np.exp(-t/self.lam_decay) + self.lam2 )
+        for ii in range(self.n_angle):
+            t_matrix[               ii,                ii] = 0.0
+            t_matrix[               ii,    3*self.n_angle] = self.dt
+            t_matrix[               ii,  3*self.n_angle+1] = self.dt
+            t_matrix[               ii, ii+  self.n_angle] = self.dt
+            t_matrix[ii+  self.n_angle, ii+  self.n_angle] = 0.0
+            t_matrix[ii+2*self.n_angle, ii+2*self.n_angle] = -2.0 * new_lam * self.dt
+            t_matrix[ii+  self.n_angle, ii+2*self.n_angle] = self.dt
+            t_matrix[ii+2*self.n_angle, ii+  self.n_angle] = -new_lam**2 * self.dt
+        t_matrix[3*self.n_angle + 1, 3*self.n_angle+2] = self.dt
+        
+        q_matrix = np.zeros([3 * self.n_angle+3, 3 * self.n_angle+3])
+        cov_mat  = self.dt * 4. * new_lam**3 * self.kappa * get_corr(self.angles, self.beta)
+        for ii in range(self.n_angle):
+            for jj in range(self.n_angle):
+                q_matrix[2*self.n_angle + jj, 2*self.n_angle + ii] = cov_mat[jj, ii]
+        
+        tmp_matrix = np.zeros([6 * self.n_angle+6, 6 * self.n_angle+6])
+        tmp_matrix[:(3*self.n_angle+3), :(3*self.n_angle+3)] = t_matrix
+        tmp_matrix[:(3*self.n_angle+3), (3*self.n_angle+3):] = q_matrix
+        tmp_matrix[(3*self.n_angle+3):, (3*self.n_angle+3):] = -t_matrix.T
+
+        tmp_matrix = expm(tmp_matrix)
+        t_matrix   = tmp_matrix[:(3*self.n_angle+3), :(3*self.n_angle+3)]
+        q_matrix   = np.matmul(tmp_matrix[:(3*self.n_angle+3), (3*self.n_angle+3):], t_matrix.T)
+        
+        return t_matrix, q_matrix
+    
+    def get_h_matrix(self, obs_ind):
+        h_matrix = np.zeros([3 * self.n_angle + 3, 3 * self.n_angle + 3])
+        for ii in obs_ind:
+            h_matrix[ii, ii] = 1.0
+        h_matrix[:,3 * self.n_angle]   = 1.0
+        h_matrix[:,3 * self.n_angle+1] = 1.0
+        return h_matrix[obs_ind, :]
+        
+    def fit_model(self):
+        self.kf_mean = self.kf_mean * 0.
+        self.kf_cov  = self.kf_cov * 0.
+        self.l_like  = 0.
+        
+        self.kf_mean[:self.n_angle,0] = self.init_r
+        if not hasattr(self, 'n_times'):
+            raise Exception("Must read data before fitting model")
+        
+        init_cov = np.zeros([3 * self.n_angle+3, 3 * self.n_angle+3])
+        cor_mat  = get_corr(self.angles, self.beta)
+        for ii in range(self.n_angle):
+            for jj in range(self.n_angle):
+                init_cov[1*self.n_angle + jj, 1*self.n_angle + ii] = self.kappa * cor_mat[jj, ii]
+                init_cov[2*self.n_angle + jj, 2*self.n_angle + ii] = self.kappa * self.lam**2 * cor_mat[jj, ii]
+
+        init_cov[3 * self.n_angle    , 3 * self.n_angle    ] = self.con_scale**2
+        init_cov[3 * self.n_angle + 1, 3 * self.n_angle + 1] = self.lin_scale**2 * 0**2 # Warped initial time is 0
+        init_cov[3 * self.n_angle + 1, 3 * self.n_angle + 2] = self.lin_scale**2 * 0 # Warped initial time is 0
+        init_cov[3 * self.n_angle + 2, 3 * self.n_angle + 1] = self.lin_scale**2 * 0 # Warped initial time is 0
+        init_cov[3 * self.n_angle + 2, 3 * self.n_angle + 2] = self.lin_scale**2
+        
+        self.kf_cov[:, :, 0] = init_cov
+        
+        s_matrix = np.zeros([3 * self.n_probe, 3 * self.n_probe])
+        for ii in range(self.n_probe):
+            s_matrix[               ii,                ii] = self.sigsq_pos
+            s_matrix[ii + self.n_probe, ii + self.n_probe] = self.sigsq_vel
+
+        diff_angle =  self.obs_angles[:, 0] - self.probe_angles
+        y_vel      = -self.probe_vel[0, :]/np.cos(diff_angle)
+        y_pos      =  self.probe_pos[0, :]
+
+        obs_ind1 = np.concatenate((np.where(~np.isnan(y_pos))[0], np.where(~np.isnan(y_vel))[0] + self.n_probe))
+        if np.size(obs_ind1) > 0:
+            obs_ind2 = np.concatenate((np.where(~np.isnan(y_pos))[0], np.where(~np.isnan(y_vel))[0] + self.n_angle))
+            y_vector = np.concatenate((y_pos[~np.isnan(y_pos)], y_vel[~np.isnan(y_vel)]))
+            h_matrix = self.get_h_matrix(obs_ind2)
+
+            f_matrix = h_matrix @ self.kf_cov[:, :, 0] @ h_matrix.T + s_matrix[obs_ind1, :][:, obs_ind1]
+            try:
+                chol_f   = cho_factor(f_matrix)
+            except:
+                print("Cholesky Failed. Setting log likelihood to -10.^10")
+                self.l_like = -10.**10
+                return 0
+
+            resid  = y_vector - h_matrix @ self.kf_mean[:, 0]
+            wresid = self.outlier_psi(resid, np.sqrt(np.diag(f_matrix)) )
+            d_ind  = [False if np.abs(wresid[jjj]) >= 3*np.sqrt(np.diag(f_matrix))[jjj] else True for jjj in range(len(wresid))]
+            
+            h_matrix = h_matrix[d_ind, :]
+            wresid   = wresid[d_ind]
+            n_outlie = len(wresid) - np.sum(d_ind)
+            
+            f_matrix = f_matrix[d_ind,:][:,d_ind]
+            chol_f   = cho_factor(f_matrix)
+
+            self.kf_mean[:, 0]   = self.kf_mean[:, 0] + (self.kf_cov[:, :, 0] @ h_matrix.T) @ cho_solve(chol_f, wresid)
+            self.kf_cov[:, :, 0] = self.kf_cov[:, :, 0] - np.matmul(self.kf_cov[:, :, 0] @ h_matrix.T,
+                                                                 cho_solve(chol_f, h_matrix @ self.kf_cov[:, :, 0]))           
+            try:
+                self.l_like += multivariate_normal.logpdf(wresid, np.zeros(wresid.shape), f_matrix)
+                if n_outlie > 0:
+                    self.l_like += multivariate_normal.logpdf(np.repeat(3,n_outlie), np.zeros(n_outlie), np.eye(n_outlie))
+            except:
+                print(resid)
+                print(wresid)
+                print(resid/wresid)
+                print("Line 351")
+                print("Cholesky Failed. Setting log likelihood to -10.^10")
+                self.l_like = -10.**10
+                return 0
+
+        for tt in np.arange(1, self.n_times):
+            t_matrix, q_matrix = self.get_t_q_matrices(tt)
+
+            m_tmp    = t_matrix @ self.kf_mean[:, tt - 1]
+            c_tmp    = t_matrix @ (self.kf_cov[:, :, tt - 1] @ t_matrix.T) + q_matrix
+            
+            diff_angle = self.obs_angles[:, tt-1] - self.probe_angles
+            y_vel      = -self.probe_vel[tt, :] / np.cos(diff_angle)
+            y_pos      =  self.probe_pos[tt, :]
+            obs_ind1   = np.concatenate((np.where(~np.isnan(y_pos))[0], np.where(~np.isnan(y_vel))[0] + self.n_probe))
+
+            if np.size(obs_ind1) > 0:
+                obs_ind2 = np.concatenate((np.where(~np.isnan(y_pos))[0], np.where(~np.isnan(y_vel))[0] + self.n_angle))
+                y_vector = np.concatenate((y_pos[~np.isnan(y_pos)], y_vel[~np.isnan(y_vel)]))
+                h_matrix = self.get_h_matrix(obs_ind2)
+
+                c_tz     = c_tmp @ h_matrix.T
+                f_matrix = h_matrix @ c_tz + s_matrix[obs_ind1, :][:, obs_ind1]
+                try:
+                    chol_f   = cho_factor(f_matrix)
+                except:
+                    print("Cholesky Failed. Setting log likelihood to -10.^10")
+                    self.l_like = -10.**10
+                    return 0
+
+                resid  = y_vector - h_matrix @ m_tmp
+                if tt > 500:
+                    wresid = self.outlier_psi(resid, np.sqrt(np.diag(f_matrix)) )
+
+                    d_ind  = [False if np.abs(wresid[jjj]) >= 3*np.sqrt(np.diag(f_matrix))[jjj] else True for jjj in range(len(wresid))]
+
+                    h_matrix = h_matrix[d_ind, :]
+                    wresid   = wresid[d_ind]
+                    n_outlie = len(wresid) - np.sum(d_ind)
+
+                    if np.sum(d_ind) == 0.:
+                        self.kf_mean[:, tt]   = m_tmp
+                        self.kf_cov[:, :, tt] = c_tmp
+                        continue
+
+                    c_tz     = c_tz[:,d_ind]
+                    f_matrix = f_matrix[d_ind,:][:,d_ind]
+                    chol_f   = cho_factor(f_matrix)
+                else:
+                    wresid   = resid
+                    n_outlie = 0
+
+                self.kf_mean[:, tt]   = m_tmp + c_tz @ cho_solve(chol_f, wresid)
+                self.kf_cov[:, :, tt] = c_tmp - c_tz @ cho_solve(chol_f, c_tz.T)
+
+                try:
+                    self.l_like += multivariate_normal.logpdf(wresid, np.zeros(wresid.shape), f_matrix)
+                    if n_outlie > 0:
+                        print(tt, n_outlie)
+                        self.l_like += multivariate_normal.logpdf(np.repeat(3,n_outlie), np.zeros(n_outlie), np.eye(n_outlie))
+
+                except:
+                    print("Cholesky Failed. Setting log likelihood to -10.^10")
+                    self.l_like = -10.**10
+                    return 0
+            else:
+                self.kf_mean[:, tt]   = m_tmp
+                self.kf_cov[:, :, tt] = c_tmp
+
+            self.obs_angles[:, tt]                = self.obs_angles[:, tt-1] #pole_front[:, 1]
+            self.angles[range(self.n_probe)]      = self.obs_angles[:, tt]
+
+        for tt in (np.arange(1,self.n_times)[::-1]):
+            t_matrix, q_matrix = self.get_t_q_matrices(tt-1)
+
+            m_tmp    = t_matrix @ self.kf_mean[:, tt - 1]
+            c_tmp    = t_matrix @ (self.kf_cov[:, :, tt - 1] @ t_matrix.T) + q_matrix
+            G_matrix = self.kf_cov[:, :, tt - 1] @ ( t_matrix.T @ inv(c_tmp + 1.e-10*np.eye(c_tmp.shape[0])) )
+            
+            self.kf_mean[:, tt-1]   = self.kf_mean[:, tt-1]   + G_matrix @ (self.kf_mean[:, tt] - m_tmp)
+            self.kf_cov[:, :, tt-1] = self.kf_cov[:, :, tt-1] + G_matrix @ (self.kf_cov[:, :, tt] - c_tmp) @ G_matrix.T
+
+        h_mat = self.get_h_matrix( np.arange(self.n_angle, self.n_angle*2))
+        self.vel_mean = -h_mat @ self.kf_mean
+        self.vel_cov  = np.zeros([self.n_angle, self.n_angle, self.n_times])
+        for tt in np.arange(self.n_times):
+            self.vel_cov[:,:,tt]  = h_mat @ self.kf_cov[:,:, tt] @ h_mat.T
+                                 
+        h_mat = np.eye(self.n_angle, 3*self.n_angle + 3)
+        self.pos_mean = h_mat @ self.kf_mean
+        self.pos_cov  = np.zeros([self.n_angle, self.n_angle, self.n_times])
+        for tt in np.arange(self.n_times):
+            self.pos_cov[:,:,tt]  = h_mat @ self.kf_cov[:,:, tt] @ h_mat.T
+
+        self.vel_var = np.zeros(self.vel_mean.shape)
+        self.pos_var = np.zeros(self.pos_mean.shape)
+        for ii in range(self.n_angle):
+            j_time = self.jump_times(self.angles[ii])
+            t_inds = np.where(self.times >= j_time)
+            nt     = np.array(t_inds).size
+            self.kf_mean[ii + self.n_angle, :]             = self.kf_mean[ii + self.n_angle,:]
+            self.kf_mean[ii, t_inds]                       = self.kf_mean[ii,range(nt)]
+            self.kf_mean[ii + self.n_angle, t_inds]        = self.kf_mean[ii + self.n_angle,range(nt)]
+            self.kf_mean[ii, :t_inds[0][0]]                = 0.
+            self.kf_mean[ii + self.n_angle, :t_inds[0][0]] = 0.
+            self.kf_var[ii, t_inds]                        = self.kf_cov[ii,ii,range(nt)]
+            self.kf_var[ii + self.n_angle, t_inds]         = self.kf_cov[ii + self.n_angle,ii + self.n_angle,range(nt)]
+            
+            self.vel_mean[ii, t_inds]                      = self.vel_mean[ii, range(nt)]
+            self.pos_mean[ii, t_inds]                      = self.pos_mean[ii, range(nt)]
+            self.vel_mean[ii, :t_inds[0][0]]               = 0.
+            self.pos_mean[ii, :t_inds[0][0]]               = self.init_r
+            self.vel_var[ii, t_inds]                       = self.vel_cov[ii, ii, range(nt)]
+            self.pos_var[ii, t_inds]                       = self.pos_cov[ii, ii, range(nt)]
+        # Unwarp the errors in time
+        for ii in range(self.n_probe):
+            j_time = self.jump_times(self.probe_angles[ii])
+            t_inds = np.where(self.times >= j_time)
+            nt     = np.array(t_inds).size
+            self.obs_angles[ ii , t_inds]        = self.obs_angles[ii,range(nt)]
+            self.obs_angles[ ii , :t_inds[0][0]] = self.probe_angles[ii]
+        return 1
+
